@@ -1,12 +1,9 @@
-﻿using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Net.Http;
-using System.Text;
-using System.Threading.Tasks;
-using Microsoft.AspNetCore.Http;
+﻿using System.Text;
+
 using Microsoft.AspNetCore.Mvc;
+
 using Newtonsoft.Json;
+
 using OfficeOpenXml;
 
 namespace ToolForOtis.Controllers
@@ -25,7 +22,7 @@ namespace ToolForOtis.Controllers
                 return BadRequest("Username and password are required.");
 
             // Parse Excel File
-            List<string> imoList = new();
+            List<ExcelColumns> excelData = new();
             using (var stream = new MemoryStream())
             {
                 await file.CopyToAsync(stream);
@@ -38,7 +35,26 @@ namespace ToolForOtis.Controllers
                     var rowCount = worksheet.Dimension.Rows;
                     for (int row = 2; row <= rowCount; row++) // Assuming first row is header
                     {
-                        imoList.Add(worksheet.Cells[row, 1].Text);
+                        string timestampUTC;
+                        var cellValue = worksheet.Cells[row, 3].Value;
+                        if (cellValue is double numericValue)
+                        {
+                            DateTime timestamp = DateTime.FromOADate(numericValue);
+                            timestampUTC = timestamp.ToString("yyyy-MM-dd HH:mm:ss");
+                        }
+                        else
+                        {
+                            timestampUTC = worksheet.Cells[row, 3].Text;
+                        }
+
+                        excelData.Add(
+                            new ExcelColumns()
+                            {
+                                IMO = worksheet.Cells[row, 1].Text,
+                                VesselName = worksheet.Cells[row, 2].Text,
+                                TimestampUTC = timestampUTC,
+                                Report = worksheet.Cells[row, 4].Text
+                            });
                     }
                 }
             }
@@ -50,9 +66,18 @@ namespace ToolForOtis.Controllers
 
             var fleetList = fleetResponse.Data.Fleet;
 
+            // Match IMOs with fleet list
+            var validImos = excelData
+                .Where(x => fleetList.Any(y => x.IMO == y.Imo))
+                .Select(x => x.IMO)
+                .ToList();
+
+            if (!validImos.Any())
+                return NotFound("No matching IMOs found.");
+
             // Step 2: Match IMOs from Excel with the fleet list to get serials
             var matchedSerials = fleetList
-                .Where(f => imoList.Contains(f.Imo))
+                .Where(x => validImos.Contains(x.Imo))
                 .Select(f => f.Serial)
                 .ToList();
 
@@ -64,7 +89,9 @@ namespace ToolForOtis.Controllers
             if (reports == null)
                 return StatusCode(500, "Failed to fetch report data.");
 
-            return Ok(reports);
+            var outputFileName = ExcelGenerator.GenerateReportExcel(excelData, reports, file.FileName);
+
+            return Ok(new { Message = "Report generated successfully.", FileName = outputFileName });
         }
 
         private async Task<FleetApiResponse> CallFleetApi(string username, string password)
@@ -82,7 +109,7 @@ namespace ToolForOtis.Controllers
             return JsonConvert.DeserializeObject<FleetApiResponse>(responseString);
         }
 
-        private async Task<List<Report>> CallReportsApi(string username, string password, List<string> serials)
+        private async Task<List<ReportResponse>> CallReportsApi(string username, string password, List<string> serials)
         {
             using var client = new HttpClient();
             var serialParams = string.Join("", serials.Select(s => $"<serial>{s}</serial>"));
@@ -117,6 +144,14 @@ namespace ToolForOtis.Controllers
         public string Imo { get; set; }
     }
 
+    public class ExcelColumns
+    {
+        public string IMO { get; set; }
+        public string VesselName { get; set; }
+        public string TimestampUTC {  get; set; }
+        public string Report {  get; set; }
+    }
+
     public class ReportsApiResponse
     {
         public ReportsData Data { get; set; }
@@ -124,10 +159,10 @@ namespace ToolForOtis.Controllers
 
     public class ReportsData
     {
-        public List<Report> Reports { get; set; }
+        public List<ReportResponse> Reports { get; set; }
     }
 
-    public class Report
+    public class ReportResponse
     {
         public string ReportId { get; set; }
         public string Serial { get; set; }
