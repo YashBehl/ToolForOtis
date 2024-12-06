@@ -10,7 +10,9 @@
   <ItemGroup>
     <PackageReference Include="EPPlus" Version="7.5.1" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="Stratum.Otis.Db" Version="202411.27.1" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.4.0" />
+    <PackageReference Include="System.Data.Odbc" Version="9.0.0" />
   </ItemGroup>
 
 </Project>

@@ -1,4 +1,6 @@
-﻿using System.Text;
+﻿using System.Data.Common;
+using System.Data.Odbc;
+using System.Text;
 
 using Microsoft.AspNetCore.Mvc;
 
@@ -22,7 +24,7 @@ namespace ToolForOtis.Controllers
                 return BadRequest("Username and password are required.");
 
             // Parse Excel File
-            List<ExcelColumns> excelData = new();
+            List<ExcelColumns> uploadedExcelData = new();
             using (var stream = new MemoryStream())
             {
                 await file.CopyToAsync(stream);
@@ -47,7 +49,7 @@ namespace ToolForOtis.Controllers
                             timestampUTC = worksheet.Cells[row, 3].Text;
                         }
 
-                        excelData.Add(
+                        uploadedExcelData.Add(
                             new ExcelColumns()
                             {
                                 IMO = worksheet.Cells[row, 1].Text,
@@ -67,7 +69,7 @@ namespace ToolForOtis.Controllers
             var fleetList = fleetResponse.Data.Fleet;
 
             // Match IMOs with fleet list
-            var validImos = excelData
+            var validImos = uploadedExcelData
                 .Where(x => fleetList.Any(y => x.IMO == y.Imo))
                 .Select(x => x.IMO)
                 .ToList();
@@ -89,7 +91,17 @@ namespace ToolForOtis.Controllers
             if (reports == null)
                 return StatusCode(500, "Failed to fetch report data.");
 
-            var outputFileName = ExcelGenerator.GenerateReportExcel(excelData, reports, file.FileName);
+            foreach (var report in reports)
+            {
+                var extendedReport = await CallVesselExtendedInformationApi(username, password, report.Serial);
+                report.MMSI = extendedReport.Mmsi;
+                report.S3LatestTimestamp = (await CallS3AisHistoryApi(extendedReport.Mmsi, report.Timestamp, DateTime.UtcNow.ToString("yyyy-MM-dd")))
+                                            .OrderByDescending(r => r.Timestamp).FirstOrDefault()
+                                            .Timestamp.ToString("yyyy-MM-dd HH:mm:ss");
+                report.RedshiftLatestTimestamp = await FetchRedshiftRecord(extendedReport.Mmsi, report.Timestamp);
+            }
+
+            var outputFileName = ExcelGenerator.GenerateReportExcel(uploadedExcelData, reports, file.FileName);
 
             return Ok(new { Message = "Report generated successfully.", FileName = outputFileName });
         }
@@ -124,6 +136,66 @@ namespace ToolForOtis.Controllers
             var responseString = await response.Content.ReadAsStringAsync();
             var reportsResponse = JsonConvert.DeserializeObject<ReportsApiResponse>(responseString);
             return reportsResponse?.Data?.Reports;
+        }
+
+        private async Task<VesselExtendedInformationResponse> CallVesselExtendedInformationApi(string username, string password, string serial)
+        {
+            using var client = new HttpClient();
+            var requestData = $"<otisrequest><login>{username}</login><password>{password}</password><action>GetVesselExtendedInformation</action><responseformat>json</responseformat><parameters><serial>{serial}</serial></parameters></otisrequest>";
+
+            var content = new StringContent($"data={requestData}", Encoding.UTF8, "application/x-www-form-urlencoded");
+            var response = await client.PostAsync("https://otis.stratumfive.com/api/otis.ashx", content);
+
+            if (!response.IsSuccessStatusCode)
+                return null;
+
+            var responseString = await response.Content.ReadAsStringAsync();
+            var reportsResponse = JsonConvert.DeserializeObject<VesselExtendedInformationApiResponse>(responseString);
+            return reportsResponse?.Data?.Fleet.First();
+        }
+
+        private async Task<List<S3AisHistoryApiResponse>> CallS3AisHistoryApi(string mmsi, string fromDate, string toDate)
+        {
+            using var client = new HttpClient();
+
+            var requestData = $"{{ \"dType\": \"mmsi\", \"includePositions\": \"true\", \"includeStaticAndVoyage\": \"true\", \"ids\": [ {mmsi} ], \"from\": \"{fromDate}\", \"to\": \"{toDate}\" }}";
+            var content = new StringContent($"data={requestData}", null, "application/json");
+            var response = await client.PostAsync("https://otis.stratumfive.com/api/otis.ashx", content);
+
+            if (!response.IsSuccessStatusCode)
+                return null;
+
+            var responseString = await response.Content.ReadAsStringAsync();
+            var reportsResponse = JsonConvert.DeserializeObject<List<S3AisHistoryApiResponse>>(responseString);
+            return reportsResponse;
+        }
+
+        private async Task<string> FetchRedshiftRecord(string mmsi, string fromDate)
+        {
+            string query = "SELECT reporttimestamp FROM \"redshift-db-prod\".\"public\".\"ais_positions_raw\" " +
+                $"WHERE mmsi = '{mmsi}' " +
+                $"AND reporttimestamp >= '{fromDate}' " +
+                "ORDER By reporttimestamp DESC LIMIT 1;";
+
+            using (OdbcConnection connection = new OdbcConnection("Driver=Amazon Redshift ODBC Driver (x64); Server=redshift-cluster-prod.cxmn8ifmencz.us-east-1.redshift.amazonaws.com; Database=redshift-db-prod;UID=redshiftadmin;PWD=4WXKecwm5CRIHHs;Port=5439;SSL=true;"))
+            {
+                connection.Open();
+                Console.WriteLine("Connection Successful!");
+
+                // Execute the query
+                using (OdbcCommand command = new OdbcCommand(query, connection))
+                {
+                    using (OdbcDataReader reader = command.ExecuteReader())
+                    {
+                        while (await reader.ReadAsync())
+                        {
+                            return reader[1] as string;
+                        }
+                    }
+                }
+            }
+
+            return string.Empty;
         }
     }
 
@@ -170,5 +242,33 @@ namespace ToolForOtis.Controllers
         public string Name { get; set; }
         public string Timestamp { get; set; }
         public string Description { get; set; }
+        public string MMSI { get; set; }
+        public string RedshiftLatestTimestamp { get; set; }
+        public string S3LatestTimestamp { get; set; }
+    }
+
+    public class VesselExtendedInformationApiResponse
+    {
+        public VesselExtendedInformationData Data { get; set; }
+    }
+
+    public class VesselExtendedInformationData
+    {
+        public List<VesselExtendedInformationResponse> Fleet {  get; set; }
+    }
+
+    public class VesselExtendedInformationResponse 
+    {
+        public string Serial { get; set; }
+        public string Name { get; set; }
+        public object Division { get; set; }
+        public string Imo { get; set; }
+        public string Mmsi { get; set; }
+    }
+
+    public class S3AisHistoryApiResponse
+    {
+        public string Mmsi { get; set; }
+        public DateTime Timestamp { get; set; }
     }
 }
